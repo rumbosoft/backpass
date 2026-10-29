@@ -18,6 +18,7 @@ import { statOrNull } from "../src/discovery/adapters/shared.js";
 import { associate } from "../src/discovery/association.js";
 import { discoverTranscripts } from "../src/discovery/index.js";
 import { associateUser } from "../src/scope.js";
+import { pathLooksNonInteractive } from "../src/interaction.js";
 import { readOpencodeFixture, withOpencodeHome, writeOpencodeStore } from "./helpers/opencode.js";
 
 const FIXTURES = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
@@ -1090,7 +1091,10 @@ test("normal discovery associates only trustworthy Hermes TUI sessions in projec
         ["tui-project"],
       );
       assert.equal(project.transcripts[0].association.tier, 1);
-      assert.equal(project.transcripts[0].interaction, "interactive");
+      assert.equal(
+        project.transcripts[0].interaction,
+        pathLooksNonInteractive(repoRoot) ? "non-interactive" : "interactive",
+      );
 
       const user = await discoverTranscripts({
         repo,
