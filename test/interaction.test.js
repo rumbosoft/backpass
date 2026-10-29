@@ -16,7 +16,7 @@ import * as cursorCli from "../src/discovery/adapters/cursor-cli.js";
 import * as hermes from "../src/discovery/adapters/hermes.js";
 import * as opencode from "../src/discovery/adapters/opencode.js";
 import { statOrNull } from "../src/discovery/adapters/shared.js";
-import { classifyInteraction, INTERACTIVE, NON_INTERACTIVE } from "../src/interaction.js";
+import { classifyInteraction, pathLooksNonInteractive, INTERACTIVE, NON_INTERACTIVE } from "../src/interaction.js";
 import { discoverTranscripts } from "../src/discovery/index.js";
 import { loadConfig } from "../src/config.js";
 import { foldEvidence, renderEvidenceForPrompt } from "../src/fold.js";
@@ -221,6 +221,17 @@ function initRepo() {
   return dir;
 }
 
+// Pipeline worktrees classify even CLI/root sessions as non-interactive.
+function rootInteraction(repo) {
+  return pathLooksNonInteractive(repo) ? NON_INTERACTIVE : INTERACTIVE;
+}
+
+function expectedMix(repo, interactive, nonInteractive) {
+  return rootInteraction(repo) === INTERACTIVE
+    ? { interactive, nonInteractive, total: interactive + nonInteractive }
+    : { interactive: 0, nonInteractive: interactive + nonInteractive, total: interactive + nonInteractive };
+}
+
 function writeClaude(home, { id, cwd, entrypoint }) {
   const project = path.join(home, ".claude", "projects", cwd.replaceAll(/[/\\.]/g, "-"));
   writeJsonl(path.join(project, `${id}.jsonl`), [
@@ -257,16 +268,17 @@ test("scan prints the interactive/non-interactive mix through the CLI", () => {
   });
   assert.equal(result.status, 0, result.stderr);
   const payload = JSON.parse(result.stdout);
-  assert.deepEqual(payload.mix, { interactive: 1, nonInteractive: 2, total: 3 });
-  assert.equal(payload.transcripts.filter((t) => t.interaction === INTERACTIVE).length, 1);
-  assert.equal(payload.transcripts.filter((t) => t.interaction === NON_INTERACTIVE).length, 2);
+  const mix = expectedMix(repo, 1, 2);
+  assert.deepEqual(payload.mix, mix);
+  assert.equal(payload.transcripts.filter((t) => t.interaction === INTERACTIVE).length, mix.interactive);
+  assert.equal(payload.transcripts.filter((t) => t.interaction === NON_INTERACTIVE).length, mix.nonInteractive);
 
   const human = spawnSync(process.execPath, [CLI, "scan", "--harness", "claude", "--since", "all"], {
     cwd: repo,
     env: { ...process.env, HOME: home, USERPROFILE: home, NO_COLOR: "1" },
     encoding: "utf8",
   });
-  assert.match(human.stdout, /interactive 1 · non-interactive 2/);
+  assert.ok(human.stdout.includes(`interactive ${mix.interactive} · non-interactive ${mix.nonInteractive}`));
 });
 
 test("scan --json on a plain Pi store ignores deeper files and carries no observer fields until includeOmp is set", () => {
@@ -308,9 +320,9 @@ test("scan --json on a plain Pi store ignores deeper files and carries no observ
   const plain = scan();
   assert.deepEqual(
     plain.transcripts.map((t) => [t.nativeId, t.interaction]),
-    [["plain-root", INTERACTIVE]],
+    [["plain-root", rootInteraction(repo)]],
   );
-  assert.deepEqual(plain.mix, { interactive: 1, nonInteractive: 0, total: 1 });
+  assert.deepEqual(plain.mix, expectedMix(repo, 1, 0));
   for (const t of plain.transcripts) {
     assert.deepEqual(t.interactionSignals, {});
     for (const key of ["corroborationIdentity", "corroborationNativeId", "corroborationStartedAt"]) {
@@ -322,8 +334,8 @@ test("scan --json on a plain Pi store ignores deeper files and carries no observ
   const opted = scan();
   const byId = new Map(opted.transcripts.map((t) => [t.nativeId, t]));
   assert.deepEqual([...byId.keys()].sort(), ["omp-helper", "omp-root", "plain-root"]);
-  assert.equal(byId.get("plain-root").interaction, INTERACTIVE);
-  assert.equal(byId.get("omp-root").interaction, INTERACTIVE);
+  assert.equal(byId.get("plain-root").interaction, rootInteraction(repo));
+  assert.equal(byId.get("omp-root").interaction, rootInteraction(repo));
   assert.equal(byId.get("omp-helper").interaction, NON_INTERACTIVE);
   assert.equal(byId.get("omp-helper").corroborationNativeId, "omp-root");
 });
@@ -351,7 +363,8 @@ test("cmdScan includes the mix on the human table", async () => {
     console.log = originalLog;
     process.env.HOME = prevHome;
   }
-  assert.ok(lines.some((line) => line.includes("interactive 1 · non-interactive 1")));
+  const mix = expectedMix(repo, 1, 1);
+  assert.ok(lines.some((line) => line.includes(`interactive ${mix.interactive} · non-interactive ${mix.nonInteractive}`)));
   assert.ok(lines.some((line) => /\bKIND\b/.test(line) && /\bHARNESS\b/.test(line)));
 });
 
@@ -817,8 +830,8 @@ test("evidence records carry the category and fold reports relevance per categor
       repo: { name: "demo", root: repo, worktrees: [repo], remotes: [] },
       config,
     });
-    const human = transcripts.find((t) => t.interaction === INTERACTIVE);
-    const robot = transcripts.find((t) => t.interaction === NON_INTERACTIVE);
+    const human = transcripts.find((t) => t.nativeId === "human-1");
+    const robot = transcripts.find((t) => t.nativeId === "robot-1");
     assert.ok(human && robot);
 
     const summary = foldEvidence([
@@ -837,12 +850,20 @@ test("evidence records carry the category and fold reports relevance per categor
         gaps: [],
       },
     ]);
-    assert.deepEqual(summary.analyzedByInteraction, { [INTERACTIVE]: 1, [NON_INTERACTIVE]: 1 });
+    const interactive = rootInteraction(repo) === INTERACTIVE;
+    assert.deepEqual(summary.analyzedByInteraction, {
+      [INTERACTIVE]: interactive ? 1 : 0,
+      [NON_INTERACTIVE]: interactive ? 1 : 2,
+    });
     const row = summary.instructions.find((item) => item.instruction === "AG-001");
     assert.equal(row.relevance, 0.5);
-    assert.equal(row.relevanceByInteraction[INTERACTIVE], 1);
-    assert.equal(row.relevanceByInteraction[NON_INTERACTIVE], 0);
-    assert.match(renderEvidenceForPrompt(summary), /relevance=50\.0% \(interactive 100\.0% · non-interactive 0\.0%\)/);
+    assert.equal(row.relevanceByInteraction[INTERACTIVE], interactive ? 1 : 0);
+    assert.equal(row.relevanceByInteraction[NON_INTERACTIVE], interactive ? 0 : 0.5);
+    assert.ok(renderEvidenceForPrompt(summary).includes(
+      interactive
+        ? "relevance=50.0% (interactive 100.0% · non-interactive 0.0%)"
+        : "relevance=50.0% (interactive 0.0% · non-interactive 50.0%)",
+    ));
   } finally {
     process.env.HOME = prevHome;
   }
@@ -889,7 +910,7 @@ test("OMP subagents share their parent identity and refresh cached relations", a
     assert.notEqual(parent.identity, child.identity, "the two files remain separately analyzable");
     assert.equal(parent.corroborationIdentity, parent.identity);
     assert.equal(child.corroborationIdentity, parent.identity);
-    assert.equal(parent.interaction, INTERACTIVE);
+    assert.equal(parent.interaction, rootInteraction(repo));
     assert.equal(child.interaction, NON_INTERACTIVE);
 
     const second = await discoverTranscripts({ repo: repository, config });
@@ -1054,7 +1075,7 @@ test("standalone fold refreshes stale OMP interaction categories with unreadable
     for (const transcript of transcripts) {
       assert.equal(transcript.parentSessionId, undefined);
       const human = transcript.nativeId === "human-native";
-      assert.equal(transcript.interaction, human ? INTERACTIVE : NON_INTERACTIVE);
+      assert.equal(transcript.interaction, human ? rootInteraction(repo) : NON_INTERACTIVE);
       config.state.writeEvidence(transcript, {
         status: "ok",
         transcript: { ...transcript, interactionSignals: {}, interaction: human ? NON_INTERACTIVE : INTERACTIVE },
@@ -1080,14 +1101,18 @@ test("standalone fold refreshes stale OMP interaction categories with unreadable
         selected,
       );
       assert.equal(summary.analyzedSessions, 3);
-      assert.deepEqual(summary.analyzedByInteraction, { [INTERACTIVE]: 1, [NON_INTERACTIVE]: 2 });
+      const interactive = staleDiscoveryStamp || rootInteraction(repo) === INTERACTIVE;
+      assert.deepEqual(summary.analyzedByInteraction, {
+        [INTERACTIVE]: interactive ? 1 : 0,
+        [NON_INTERACTIVE]: interactive ? 2 : 3,
+      });
       assert.deepEqual(summary.instructions.find((row) => row.instruction === "AG-001").relevanceByInteraction, {
-        [INTERACTIVE]: 1,
-        [NON_INTERACTIVE]: 0,
+        [INTERACTIVE]: interactive ? 1 : 0,
+        [NON_INTERACTIVE]: interactive ? 0 : 1 / 3,
       });
       assert.deepEqual(summary.instructions.find((row) => row.instruction === "AG-002").relevanceByInteraction, {
         [INTERACTIVE]: 0,
-        [NON_INTERACTIVE]: 1,
+        [NON_INTERACTIVE]: interactive ? 1 : 2 / 3,
       });
     }
     assert.equal(
@@ -1147,7 +1172,7 @@ test("nested OMP subagents share the root identity once the root session appears
       assert.equal(descendant.interaction, NON_INTERACTIVE);
     }
     assert.equal(root.corroborationIdentity, root.identity);
-    assert.equal(root.interaction, INTERACTIVE);
+    assert.equal(root.interaction, rootInteraction(repo));
 
     const third = await discoverTranscripts({ repo: repository, config });
     assert.equal(third.perHarness.pi.cached, 3, "the refreshed relations are safe to reuse");
@@ -1225,7 +1250,7 @@ test("OMP subagents running in another repo cwd still share the root identity", 
       assert.equal(descendant.corroborationNativeId, "root-native");
       assert.equal(descendant.interaction, NON_INTERACTIVE);
     }
-    assert.equal(root.interaction, INTERACTIVE);
+    assert.equal(root.interaction, rootInteraction(repo));
   } finally {
     if (prevHome === undefined) delete process.env.HOME;
     else process.env.HOME = prevHome;
